@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+faiss-cpu
+numpy
+ psycopg2-binary
+pydantic
+redis
+face_recognition
+Pillow
+python-multipart

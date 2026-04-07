@@ -1,0 +1,115 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-face_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-face_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  redis:
+    image: redis:6-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  app:
+    image: fiass-face-matching-app:latest
+    restart: unless-stopped
+    ports:
+      - "8089:8089"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-face_db}
+      DB_USER: ${POSTGRES_USER:-postgres}
+      DB_PASS: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    volumes:
+      - uploads:/app/static/uploads
+      - ./main.py:/app/main.py:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8089/face/check"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+  uploads:
+
+networks:
+  backend:
+    driver: bridge
+
+
+
+# version: "3"
+
+# services:
+
+#   db:
+#     image: postgres:14
+#     restart: always
+#     environment:
+#       - POSTGRES_USER=${POSTGRES_USER}
+#       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+#       - POSTGRES_DB=${POSTGRES_DB}
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - ./faceData:/var/lib/postgresql/data  # ✅ Save DB files to ./pgdata on your machine
+
+#   redis:
+#     image: redis:6
+#     restart: always
+#     command: ["redis-server", "--save", "", "--appendonly", "no", "--stop-writes-on-bgsave-error", "no"]
+#     ports:
+#       - "6379:6379"
+
+#   app:
+#     build: .
+#     restart: always
+#     ports:
+#       - "8089:8089"
+#     depends_on:
+#       - db
+#       - redis
+#     environment:
+#       - DB_HOST=${POSTGRES_HOST}
+#       - DB_PORT=${POSTGRES_PORT}
+#       - DB_NAME=${POSTGRES_DB}
+#       - DB_USER=${POSTGRES_USER}
+#       - DB_PASS=${POSTGRES_PASSWORD}
+#       - REDIS_HOST=${REDIS_HOST}
+#       - REDIS_PORT=${REDIS_PORT}
