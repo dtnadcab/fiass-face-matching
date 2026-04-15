@@ -35,6 +35,7 @@ services:
       - backend
 
   app:
+    build: .
     image: fiass-face-matching-app:latest
     restart: unless-stopped
     ports:
@@ -52,6 +53,10 @@ services:
       DB_PASS: ${POSTGRES_PASSWORD:-postgres}
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      KV_URL: ${KV_URL:-}
+      REDIS_URL: ${REDIS_URL:-}
+      # Grainy / soft phone photos — tune down if legitimate rejects
+      FACE_MIN_BLUR_VARIANCE: ${FACE_MIN_BLUR_VARIANCE:-40}
     volumes:
       - uploads:/app/static/uploads
       - ./main.py:/app/main.py:ro

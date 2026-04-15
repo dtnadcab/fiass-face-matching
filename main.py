@@ -1,3 +1,5 @@
+import _pkg_resources_compat  # noqa: F401 — must load before face_recognition on Py3.12+
+
 from fastapi import FastAPI, HTTPException, Request, File, UploadFile
 import faiss
 import numpy as np
@@ -12,6 +14,8 @@ import pickle
 import hashlib
 import os
 import time
+import json
+import base64
 import face_recognition
 from PIL import Image, ExifTags, ImageOps
 import io
@@ -20,6 +24,20 @@ import uuid
 import math
 import cv2
 from skimage import exposure
+
+# Load .env so DB_HOST / DB_NAME / REDIS_URL etc. apply (same keys as docker-compose)
+def _load_env_local():
+    try:
+        from dotenv import load_dotenv
+
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if os.path.isfile(env_path):
+            load_dotenv(env_path)
+    except ImportError:
+        pass
+
+
+_load_env_local()
 
 # ------------------------------------------------------------------------------
 # Configuration
@@ -32,17 +50,21 @@ HIGH_CONFIDENCE_THRESHOLD = 0.95  # 95% minimum for positive match
 BASE_THRESHOLD = 0.85             # Regular threshold
 APPEARANCE_VARIATION_THRESHOLD = 0.80  # For minor variations
 MIN_FACE_SIZE = 100  # Minimum face size in pixels
+# Laplacian variance on face ROI — below this = reject as too blurry (tune via env)
+FACE_MIN_BLUR_VARIANCE = float(os.getenv("FACE_MIN_BLUR_VARIANCE", "55"))
 CACHE_TTL = 300  # 5 minutes cache TTL
 MAX_CACHE_SIZE = 1000  # Maximum cache size for descriptors
 
-# Environment Variables
-POSTGRES_HOST = os.getenv("DB_HOST", "localhost")
-POSTGRES_PORT = int(os.getenv("DB_PORT", 5432))
-POSTGRES_DB = os.getenv("DB_NAME", "postgres")
-POSTGRES_USER = os.getenv("DB_USER", "postgres")
-POSTGRES_PASS = os.getenv("DB_PASS", "postgres")
+# Environment Variables (DB_* preferred; POSTGRES_* fallback for legacy .env)
+POSTGRES_HOST = os.getenv("DB_HOST") or os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("DB_PORT") or os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("DB_NAME") or os.getenv("POSTGRES_DB", "postgres")
+POSTGRES_USER = os.getenv("DB_USER") or os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASS = os.getenv("DB_PASS") or os.getenv("POSTGRES_PASSWORD", "postgres")
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("KV_URL")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+USE_FAKE_REDIS = os.getenv("REDIS_FAKE", "").lower() in ("1", "true", "yes")
 
 # ------------------------------------------------------------------------------
 # Database and Redis Setup
@@ -66,7 +88,48 @@ def get_db_conn():
 def put_db_conn(conn):
     pool.putconn(conn)
 
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+def _build_redis_client():
+    if USE_FAKE_REDIS:
+        import fakeredis
+        return fakeredis.FakeRedis(), True
+
+    if REDIS_URL:
+        try:
+            client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+            return client, False
+        except Exception as e:
+            print(f"[redis] Invalid REDIS_URL/KV_URL, falling back to REDIS_HOST/REDIS_PORT: {e}")
+
+    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0), False
+
+r, _redis_is_fake = _build_redis_client()
+
+def cache_json_event(key: str, payload: Dict, ttl_sec: int = 3600) -> None:
+    """Best-effort Redis writer for observability; never breaks API flow."""
+    try:
+        r.setex(key, ttl_sec, json.dumps(payload, default=str))
+    except Exception as e:
+        logger.warning(f"Redis cache write failed for key={key}: {e}")
+
+def cache_face_details(
+    key_prefix: str,
+    descriptor: Optional[np.ndarray] = None,
+    image_bytes: Optional[bytes] = None,
+    ttl_sec: int = 86400,
+    meta: Optional[Dict] = None,
+) -> None:
+    """Store descriptor/image details in Redis for debugging and traceability."""
+    payload: Dict = dict(meta or {})
+    if descriptor is not None:
+        arr = np.array(descriptor, dtype=np.float32)
+        payload["descriptor_dim"] = int(arr.shape[0])
+        payload["descriptor"] = [round(float(x), 8) for x in arr.tolist()]
+        payload["descriptor_sha256"] = hashlib.sha256(arr.tobytes()).hexdigest()
+    if image_bytes is not None:
+        payload["image_sha256"] = hashlib.sha256(image_bytes).hexdigest()
+        payload["image_base64"] = base64.b64encode(image_bytes).decode("ascii")
+        payload["image_bytes"] = len(image_bytes)
+    cache_json_event(key_prefix, payload, ttl_sec=ttl_sec)
 
 # ------------------------------------------------------------------------------
 # FAISS Index Setup
@@ -256,6 +319,46 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     except Exception as e:
         logger.error(f"Preprocessing failed: {str(e)}")
         raise HTTPException(400, "Image processing failed")
+
+def face_crop_laplacian_variance(img_np: np.ndarray, face_location) -> float:
+    """Sharpness proxy: higher = sharper. face_location is (top, right, bottom, left)."""
+    try:
+        top, right, bottom, left = face_location
+        h, w = img_np.shape[:2]
+        top = max(0, int(top))
+        left = max(0, int(left))
+        bottom = min(h, int(bottom))
+        right = min(w, int(right))
+        if bottom <= top + 1 or right <= left + 1:
+            return 0.0
+        crop = img_np[top:bottom, left:right]
+        if crop.size == 0:
+            return 0.0
+        if crop.ndim == 3:
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = crop
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception as e:
+        logger.warning(f"Laplacian variance failed: {e}")
+        return 0.0
+
+
+def blur_rejection_payload(img_np: np.ndarray, face_location, min_var: float) -> Optional[Dict]:
+    """If face ROI is too blurry, return API error dict; else None."""
+    v = face_crop_laplacian_variance(img_np, face_location)
+    if v < min_var:
+        logger.warning(
+            f"[blur] Rejecting: laplacian_var={v:.2f} < min={min_var:.2f}"
+        )
+        return {
+            "status": False,
+            "message": "Image too blurry — hold steady, use good light, and retake",
+            "blur_score": round(v, 2),
+            "min_blur_required": min_var,
+        }
+    return None
+
 
 def validate_face(face_location, image_size) -> bool:
     """Validate face size and position."""
@@ -454,10 +557,11 @@ def initialize_faiss_index():
         put_db_conn(conn)
 
 # Constants at the top of your file
-ADD_FACE_REJECT_THRESHOLD = 0.895  # 89.5% - Reject addition if match found at or above this
-SEARCH_FACE_MATCH_THRESHOLD = 0.84  # Enterprise-grade: catches glasses, beard, haircut variations
-SEARCH_HIGH_CONFIDENCE = 0.92       # High confidence match (clean, no accessories)
-SEARCH_APPEARANCE_VARIATION = 0.68  # Floor threshold when glasses/beard/hat detected
+ADD_FACE_REJECT_THRESHOLD = float(os.getenv("ADD_FACE_REJECT_THRESHOLD", "0.895"))
+SEARCH_FACE_MATCH_THRESHOLD = float(os.getenv("SEARCH_FACE_MATCH_THRESHOLD", "0.84"))
+SEARCH_HIGH_CONFIDENCE = float(os.getenv("SEARCH_HIGH_CONFIDENCE", "0.92"))
+# Only used when should_adjust_threshold() is true (second pass); stricter default than 0.68
+SEARCH_APPEARANCE_VARIATION = float(os.getenv("SEARCH_APPEARANCE_VARIATION", "0.72"))
 
 def face_exists(vector: np.ndarray) -> Tuple[bool, Optional[str], Optional[float]]:
     """Check if face exists above the rejection threshold"""
@@ -700,9 +804,9 @@ def get_face_encoding(image: np.ndarray, face_location: tuple) -> Optional[np.nd
 # ------------------------------------------------------------------------------
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
 UPLOAD_FOLDER = "static/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -734,6 +838,7 @@ def delete_face(user_id: str):
 async def get_face_embedding(request: Request, image: UploadFile = File(...)):
     t0 = time.time()
     rotated_image_url = None
+    req_id = str(uuid.uuid4())
     try:
         contents = await image.read()
         img = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -752,11 +857,17 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
         img_np = np.array(img)
         face_locations, det_img = robust_face_detection(img_np, label="get-face-embedding")
         if not face_locations:
-            return {
+            resp = {
                 "status": False,
                 "message": "No face detected in file",
                 "rotated_image_url": rotated_image_url
             }
+            cache_json_event(
+                f"fiass:face:get-face-embedding:req:{req_id}",
+                {"endpoint": "get-face-embedding", "status": False, "reason": "no_face", "response": resp},
+                ttl_sec=3600,
+            )
+            return resp
 
         det_pil = Image.fromarray(det_img)
         best_index = get_most_centered_face(face_locations, det_pil.size)
@@ -764,20 +875,43 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
             best_index = 0
 
         best_face = face_locations[best_index]
+        blur_err = blur_rejection_payload(det_img, best_face, FACE_MIN_BLUR_VARIANCE)
+        if blur_err:
+            blur_err["rotated_image_url"] = rotated_image_url
+            cache_json_event(
+                f"fiass:face:get-face-embedding:req:{req_id}",
+                {"endpoint": "get-face-embedding", "status": False, "reason": "blur", "response": blur_err},
+                ttl_sec=3600,
+            )
+            return blur_err
+
         descriptor = get_robust_face_encoding(det_img, best_face, fast_mode=fast)
         if descriptor is None:
-            return {
+            resp = {
                 "status": False,
                 "message": "Failed to extract face features",
                 "rotated_image_url": rotated_image_url
             }
+            cache_json_event(
+                f"fiass:face:get-face-embedding:req:{req_id}",
+                {"endpoint": "get-face-embedding", "status": False, "reason": "encoding_failed", "response": resp},
+                ttl_sec=3600,
+            )
+            return resp
         
         arr = np.array(descriptor, dtype=np.float32)
+        cache_face_details(
+            f"fiass:face:get-face-embedding:req:{req_id}:details",
+            descriptor=arr,
+            image_bytes=contents,
+            ttl_sec=86400,
+            meta={"endpoint": "get-face-embedding", "request_id": req_id},
+        )
         
         if arr.shape[0] != DIM:
             raise HTTPException(400, f"Invalid face vector length. Expected {DIM}, got {arr.shape[0]}.")
         
-        # Two-pass search: fast first, then adaptive if no match
+        # Strict search first; loosen only when appearance-variation heuristics fire (never always-loosen).
         results = search_face(arr, threshold_override=SEARCH_FACE_MATCH_THRESHOLD)
         has_variation = False
         
@@ -785,14 +919,11 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
             has_variation = should_adjust_threshold(best_face, det_img)
             if has_variation:
                 results = search_face(arr, threshold_override=SEARCH_APPEARANCE_VARIATION)
-            else:
-                results = search_face(arr, threshold_override=SEARCH_APPEARANCE_VARIATION)
-                has_variation = True
         
         elapsed_ms = int((time.time() - t0) * 1000)
         
         if not results:
-            return {
+            resp = {
                 "status": False,
                 "matches": [],
                 "message": "No matching face found",
@@ -801,9 +932,20 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
                 "elapsed_ms": elapsed_ms,
                 "rotated_image_url": rotated_image_url
             }
+            cache_json_event(
+                f"fiass:face:get-face-embedding:req:{req_id}",
+                {"endpoint": "get-face-embedding", "status": False, "reason": "no_match", "response": resp},
+                ttl_sec=3600,
+            )
+            cache_json_event(
+                "fiass:face:get-face-embedding:last",
+                {"endpoint": "get-face-embedding", "status": False, "reason": "no_match", "request_id": req_id, "response": resp},
+                ttl_sec=86400,
+            )
+            return resp
         
         best_match = results[0]
-        return {
+        resp = {
             "status": True,
             "match": {
                 "user_id": best_match["user_id"],
@@ -815,24 +957,59 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
             "elapsed_ms": elapsed_ms,
             "rotated_image_url": rotated_image_url
         }
+        cache_payload = {
+            "endpoint": "get-face-embedding",
+            "status": True,
+            "request_id": req_id,
+            "user_id": best_match["user_id"],
+            "similarity": round(best_match["similarity"], 4),
+            "appearance_variation": has_variation,
+            "elapsed_ms": elapsed_ms,
+        }
+        cache_json_event(f"fiass:face:get-face-embedding:req:{req_id}", cache_payload, ttl_sec=3600)
+        cache_json_event("fiass:face:get-face-embedding:last", cache_payload, ttl_sec=86400)
+        cache_json_event(f"fiass:face:user:{best_match['user_id']}:last_match", cache_payload, ttl_sec=86400)
+        cache_face_details(
+            f"fiass:face:user:{best_match['user_id']}:details:last",
+            descriptor=arr,
+            image_bytes=contents,
+            ttl_sec=86400,
+            meta={"endpoint": "get-face-embedding", "request_id": req_id, "user_id": best_match["user_id"]},
+        )
+        return resp
 
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Error in get-face-embedding: {str(e)}", exc_info=True)
-        return {
+        resp = {
             "status": False,
             "message": str(e),
             "rotated_image_url": rotated_image_url
         }
+        cache_json_event(
+            f"fiass:face:get-face-embedding:req:{req_id}",
+            {"endpoint": "get-face-embedding", "status": False, "reason": "exception", "message": str(e)},
+            ttl_sec=3600,
+        )
+        return resp
 
 @app.post("/face/add_face/{user_id}")
 async def add_face_endpoint(user_id: str, image: UploadFile = File(...)):
     try:
+        # Keep original image bytes for Redis debugging snapshot.
+        await image.seek(0)
+        raw_image_bytes = await image.read()
+        await image.seek(0)
+
         # Process image and get face location
         img_np, face_location = await process_uploaded_image(image)
         if img_np is None or face_location is None:
             raise HTTPException(400, "No face detected or face too small")
+
+        blur_err = blur_rejection_payload(img_np, face_location, FACE_MIN_BLUR_VARIANCE)
+        if blur_err:
+            raise HTTPException(400, blur_err.get("message", "Image too blurry"))
 
         # Get face encoding
         encoding = get_face_encoding(img_np, face_location)
@@ -855,6 +1032,13 @@ async def add_face_endpoint(user_id: str, image: UploadFile = File(...)):
 
         # Add to database
         face_id, message = add_face(user_id, encoding)
+        cache_face_details(
+            f"fiass:face:user:{user_id}:details:registered",
+            descriptor=np.array(encoding, dtype=np.float32),
+            image_bytes=raw_image_bytes,
+            ttl_sec=7 * 86400,
+            meta={"endpoint": "add_face", "user_id": user_id, "face_id": face_id},
+        )
         return {
             "status": True,
             "id": face_id,
@@ -891,6 +1075,13 @@ async def add_face_descriptor_endpoint(user_id: str, data: FaceData):
             )
 
         face_id, message = add_face(user_id, normalized)
+        cache_face_details(
+            f"fiass:face:user:{user_id}:details:descriptor_registered",
+            descriptor=normalized,
+            image_bytes=None,
+            ttl_sec=7 * 86400,
+            meta={"endpoint": "add_face_descriptor", "user_id": user_id, "face_id": face_id},
+        )
         return {
             "status": True,
             "id": face_id,
@@ -905,35 +1096,47 @@ async def add_face_descriptor_endpoint(user_id: str, data: FaceData):
 
 @app.post("/face/search")
 async def search_endpoint(image: UploadFile = File(...)):
+    req_id = str(uuid.uuid4())
     try:
         img_np, face_location = await process_uploaded_image(image)
         if img_np is None or face_location is None:
-            return {
+            resp = {
                 "status": False,
                 "message": "No face detected"
             }
+            cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "no_face", "response": resp}, 3600)
+            return resp
+
+        blur_err = blur_rejection_payload(img_np, face_location, FACE_MIN_BLUR_VARIANCE)
+        if blur_err:
+            cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "blur", "response": blur_err}, 3600)
+            return blur_err
 
         encoding = get_face_encoding(img_np, face_location)
         if encoding is None:
-            return {
+            resp = {
                 "status": False,
                 "message": "Could not extract face features"
             }
+            cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "encoding_failed", "response": resp}, 3600)
+            return resp
 
         has_variation = should_adjust_threshold(face_location, img_np)
         effective_threshold = SEARCH_APPEARANCE_VARIATION if has_variation else SEARCH_FACE_MATCH_THRESHOLD
         results = search_face(encoding, k=1, threshold_override=effective_threshold)
         
         if not results:
-            return {
+            resp = {
                 "status": False,
                 "message": "No matching face found",
                 "threshold": effective_threshold,
                 "appearance_variation": has_variation
             }
+            cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "no_match", "response": resp}, 3600)
+            return resp
 
         match = results[0]
-        return {
+        resp = {
             "status": True,
             "match": {
                 "user_id": match["user_id"],
@@ -942,14 +1145,28 @@ async def search_endpoint(image: UploadFile = File(...)):
             "message": f"Face matched with {match['similarity']*100:.1f}% confidence",
             "appearance_variation": has_variation
         }
+        cache_payload = {
+            "endpoint": "search",
+            "request_id": req_id,
+            "status": True,
+            "user_id": match["user_id"],
+            "similarity": round(match["similarity"], 4),
+            "appearance_variation": has_variation,
+        }
+        cache_json_event(f"fiass:face:search:req:{req_id}", cache_payload, 3600)
+        cache_json_event("fiass:face:search:last", cache_payload, 86400)
+        cache_json_event(f"fiass:face:user:{match['user_id']}:last_match", cache_payload, 86400)
+        return resp
 
     except Exception as e:
         logger.error(f"Search error: {str(e)}", exc_info=True)
+        cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "exception", "message": str(e)}, 3600)
         raise HTTPException(500, detail=str(e))
 
 @app.post("/face/search_descriptor")
 async def search_descriptor_endpoint(data: FaceData):
     """Search by raw 128-dim descriptor array (from ERP/client-side face-api.js)."""
+    req_id = str(uuid.uuid4())
     try:
         arr = np.array(data.faceData, dtype=np.float32)
         if arr.shape[0] != DIM:
@@ -959,14 +1176,16 @@ async def search_descriptor_endpoint(data: FaceData):
         results = search_face(normalized, k=1)
 
         if not results:
-            return {
+            resp = {
                 "status": False,
                 "message": "No matching face found",
                 "threshold": SEARCH_FACE_MATCH_THRESHOLD
             }
+            cache_json_event(f"fiass:face:search-descriptor:req:{req_id}", {"status": False, "reason": "no_match", "response": resp}, 3600)
+            return resp
 
         match = results[0]
-        return {
+        resp = {
             "status": True,
             "match": {
                 "user_id": match["user_id"],
@@ -974,11 +1193,23 @@ async def search_descriptor_endpoint(data: FaceData):
             },
             "message": f"Face matched with {match['similarity']*100:.1f}% confidence"
         }
+        cache_payload = {
+            "endpoint": "search_descriptor",
+            "request_id": req_id,
+            "status": True,
+            "user_id": match["user_id"],
+            "similarity": round(match["similarity"], 4),
+        }
+        cache_json_event(f"fiass:face:search-descriptor:req:{req_id}", cache_payload, 3600)
+        cache_json_event("fiass:face:search-descriptor:last", cache_payload, 86400)
+        cache_json_event(f"fiass:face:user:{match['user_id']}:last_match", cache_payload, 86400)
+        return resp
 
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Search descriptor error: {str(e)}", exc_info=True)
+        cache_json_event(f"fiass:face:search-descriptor:req:{req_id}", {"status": False, "reason": "exception", "message": str(e)}, 3600)
         raise HTTPException(500, detail=str(e))
 
 @app.get("/face/check")
@@ -1033,18 +1264,25 @@ def on_startup():
         logger.error("Failed to connect to PostgreSQL.")
         raise RuntimeError("PostgreSQL connection failed.")
 
-    # Wait for Redis
-    for attempt in range(max_attempts):
-        try:
-            r.ping()
-            logger.info("Connected to Redis.")
-            break
-        except Exception as e:
-            logger.warning(f"Redis not ready (attempt {attempt + 1}/{max_attempts}): {e}")
-            time.sleep(delay)
+    # Wait for Redis (skipped when using fakeredis for local dev)
+    if _redis_is_fake:
+        logger.info("Using in-memory Redis, no TCP connection.")
     else:
-        logger.error("Failed to connect to Redis.")
-        raise RuntimeError("Redis connection failed.")
+        for attempt in range(max_attempts):
+            try:
+                r.ping()
+                if REDIS_URL:
+                    logger.info("Connected to Redis via REDIS_URL/KV_URL.")
+                else:
+                    logger.info(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}.")
+                break
+            except Exception as e:
+                logger.warning(f"Redis not ready (attempt {attempt + 1}/{max_attempts}): {e}")
+                time.sleep(delay)
+        else:
+            logger.warning("Failed to connect to Redis. Falling back to in-memory fakeredis.")
+            import fakeredis
+            globals()["r"] = fakeredis.FakeRedis()
 
 @app.on_event("shutdown")
 def on_shutdown():

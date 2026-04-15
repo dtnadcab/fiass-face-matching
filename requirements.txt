@@ -1,3 +1,4 @@
+setuptools
 fastapi
 uvicorn
 faiss-cpu
@@ -5,6 +6,8 @@ numpy
 psycopg2-binary
 pydantic
 redis
+python-dotenv>=1.0.0
+fakeredis>=2.23.0
 face_recognition
 Pillow
 python-multipart
