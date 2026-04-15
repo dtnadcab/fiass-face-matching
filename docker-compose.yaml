@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   db:
     image: postgres:14-alpine
@@ -9,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-face_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -60,8 +58,9 @@ services:
     volumes:
       - uploads:/app/static/uploads
       - ./main.py:/app/main.py:ro
+      - ./_pkg_resources_compat.py:/app/_pkg_resources_compat.py:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8089/face/check"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8089/face/check')\""]
       interval: 5s
       timeout: 5s
       retries: 6
