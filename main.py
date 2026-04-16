@@ -232,76 +232,6 @@ def get_robust_face_encoding(img_np: np.ndarray, face_location, fast_mode: bool 
         logger.error(f"Robust encoding failed: {str(e)}", exc_info=True)
         return None
 
-def should_adjust_threshold(face_location, img_np: np.ndarray) -> bool:
-    """Detect appearance variations (glasses, beard, cap, mask) that need threshold adjustment."""
-    try:
-        landmarks_list = face_recognition.face_landmarks(img_np, [face_location])
-        if not landmarks_list:
-            return True  # Can't get landmarks → face partially occluded → lower threshold
-        landmarks = landmarks_list[0]
-
-        # ── Glasses detection ──
-        left_eye = landmarks.get('left_eye', [])
-        right_eye = landmarks.get('right_eye', [])
-        left_eyebrow = landmarks.get('left_eyebrow', [])
-        right_eyebrow = landmarks.get('right_eyebrow', [])
-
-        if left_eye and right_eye:
-            all_eye_pts = left_eye + right_eye
-            y_min = max(0, min(p[1] for p in all_eye_pts) - 8)
-            y_max = min(img_np.shape[0], max(p[1] for p in all_eye_pts) + 8)
-            x_min = max(0, min(p[0] for p in all_eye_pts) - 5)
-            x_max = min(img_np.shape[1], max(p[0] for p in all_eye_pts) + 5)
-
-            if y_max > y_min and x_max > x_min:
-                eye_roi = img_np[y_min:y_max, x_min:x_max]
-                gray_roi = np.mean(eye_roi, axis=2) if eye_roi.ndim == 3 else eye_roi
-
-                # Dark frames / sunglasses: very low mean brightness in eye region
-                if np.mean(gray_roi) < 65:
-                    return True
-
-                # Spectacle frames: high edge contrast around eyes
-                edges = np.abs(np.diff(gray_roi, axis=1))
-                if np.mean(edges) > 25:
-                    return True
-
-                # Bridge check: dark strip between the two eyes
-                if left_eye and right_eye:
-                    bridge_x1 = max(p[0] for p in left_eye)
-                    bridge_x2 = min(p[0] for p in right_eye)
-                    if bridge_x2 > bridge_x1:
-                        bridge_y = int(np.mean([p[1] for p in left_eye + right_eye]))
-                        bridge_strip = img_np[max(0, bridge_y-3):bridge_y+3, bridge_x1:bridge_x2]
-                        if bridge_strip.size > 0 and np.mean(bridge_strip) < 80:
-                            return True
-
-        # ── Eyebrow-to-forehead distance (cap / hat detection) ──
-        top, right, bottom, left = face_location
-        if left_eyebrow and right_eyebrow:
-            brow_y = min(min(p[1] for p in left_eyebrow), min(p[1] for p in right_eyebrow))
-            forehead_ratio = (brow_y - top) / max(bottom - top, 1)
-            if forehead_ratio < 0.08:
-                return True
-
-        # ── Beard / facial hair detection ──
-        chin = landmarks.get('chin', [])
-        nose_tip = landmarks.get('nose_tip', [])
-        if chin and nose_tip and len(chin) >= 9:
-            chin_bottom = chin[8][1]
-            nose_bottom = nose_tip[0][1]
-            lower_face = img_np[nose_bottom:chin_bottom, left:right]
-            if lower_face.size > 0:
-                gray_lower = np.mean(lower_face, axis=2) if lower_face.ndim == 3 else lower_face
-                # Beard tends to make the lower face darker and more textured
-                if np.mean(gray_lower) < 90 or np.std(gray_lower) > 45:
-                    return True
-
-        return False
-    except Exception as e:
-        logger.debug(f"Threshold adjustment check failed: {e}")
-        return False
-
 def preprocess_image(image: Image.Image) -> Image.Image:
     """Enhanced image preprocessing for better face detection."""
     try:
@@ -559,8 +489,9 @@ def initialize_faiss_index():
 # Constants at the top of your file
 ADD_FACE_REJECT_THRESHOLD = float(os.getenv("ADD_FACE_REJECT_THRESHOLD", "0.895"))
 SEARCH_FACE_MATCH_THRESHOLD = float(os.getenv("SEARCH_FACE_MATCH_THRESHOLD", "0.84"))
-SEARCH_HIGH_CONFIDENCE = float(os.getenv("SEARCH_HIGH_CONFIDENCE", "0.92"))
-# Only used when should_adjust_threshold() is true (second pass); stricter default than 0.68
+# `/face/get-face-embedding` only accepts matches at or above this similarity (default 90%).
+SEARCH_HIGH_CONFIDENCE = float(os.getenv("SEARCH_HIGH_CONFIDENCE", "0.90"))
+# Used by other flows (e.g. legacy); get-face-embedding no longer relaxes to this threshold.
 SEARCH_APPEARANCE_VARIATION = float(os.getenv("SEARCH_APPEARANCE_VARIATION", "0.72"))
 
 def face_exists(vector: np.ndarray) -> Tuple[bool, Optional[str], Optional[float]]:
@@ -911,24 +842,18 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
         if arr.shape[0] != DIM:
             raise HTTPException(400, f"Invalid face vector length. Expected {DIM}, got {arr.shape[0]}.")
         
-        # Strict search first; loosen only when appearance-variation heuristics fire (never always-loosen).
-        results = search_face(arr, threshold_override=SEARCH_FACE_MATCH_THRESHOLD)
+        # High-confidence only: no relaxed / appearance-variation second pass for this endpoint.
+        results = search_face(arr, threshold_override=SEARCH_HIGH_CONFIDENCE)
         has_variation = False
-        
-        if not results:
-            has_variation = should_adjust_threshold(best_face, det_img)
-            if has_variation:
-                results = search_face(arr, threshold_override=SEARCH_APPEARANCE_VARIATION)
-        
         elapsed_ms = int((time.time() - t0) * 1000)
         
         if not results:
             resp = {
                 "status": False,
                 "matches": [],
-                "message": "No matching face found",
-                "threshold": SEARCH_APPEARANCE_VARIATION if has_variation else SEARCH_FACE_MATCH_THRESHOLD,
-                "appearance_variation": has_variation,
+                "message": "No matching face found or confidence below minimum",
+                "threshold": SEARCH_HIGH_CONFIDENCE,
+                "appearance_variation": False,
                 "elapsed_ms": elapsed_ms,
                 "rotated_image_url": rotated_image_url
             }
@@ -950,10 +875,11 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
             "match": {
                 "user_id": best_match["user_id"],
                 "similarity": round(best_match["similarity"], 4),
-                "confidence": best_match.get("confidence", "medium")
+                "confidence": best_match.get("confidence", "high")
             },
             "message": f"Face matched with {best_match['similarity']*100:.1f}% confidence",
-            "appearance_variation": has_variation,
+            "appearance_variation": False,
+            "threshold": SEARCH_HIGH_CONFIDENCE,
             "elapsed_ms": elapsed_ms,
             "rotated_image_url": rotated_image_url
         }
@@ -963,7 +889,8 @@ async def get_face_embedding(request: Request, image: UploadFile = File(...)):
             "request_id": req_id,
             "user_id": best_match["user_id"],
             "similarity": round(best_match["similarity"], 4),
-            "appearance_variation": has_variation,
+            "appearance_variation": False,
+            "threshold": SEARCH_HIGH_CONFIDENCE,
             "elapsed_ms": elapsed_ms,
         }
         cache_json_event(f"fiass:face:get-face-embedding:req:{req_id}", cache_payload, ttl_sec=3600)
@@ -1121,16 +1048,16 @@ async def search_endpoint(image: UploadFile = File(...)):
             cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "encoding_failed", "response": resp}, 3600)
             return resp
 
-        has_variation = should_adjust_threshold(face_location, img_np)
-        effective_threshold = SEARCH_APPEARANCE_VARIATION if has_variation else SEARCH_FACE_MATCH_THRESHOLD
-        results = search_face(encoding, k=1, threshold_override=effective_threshold)
+        # Same policy as get-face-embedding: high-confidence matches only.
+        results = search_face(encoding, k=1, threshold_override=SEARCH_HIGH_CONFIDENCE)
+        has_variation = False
         
         if not results:
             resp = {
                 "status": False,
-                "message": "No matching face found",
-                "threshold": effective_threshold,
-                "appearance_variation": has_variation
+                "message": "No matching face found or confidence below minimum",
+                "threshold": SEARCH_HIGH_CONFIDENCE,
+                "appearance_variation": False
             }
             cache_json_event(f"fiass:face:search:req:{req_id}", {"status": False, "reason": "no_match", "response": resp}, 3600)
             return resp
@@ -1143,7 +1070,8 @@ async def search_endpoint(image: UploadFile = File(...)):
                 "similarity": round(match["similarity"], 4)
             },
             "message": f"Face matched with {match['similarity']*100:.1f}% confidence",
-            "appearance_variation": has_variation
+            "appearance_variation": False,
+            "threshold": SEARCH_HIGH_CONFIDENCE,
         }
         cache_payload = {
             "endpoint": "search",
@@ -1151,7 +1079,8 @@ async def search_endpoint(image: UploadFile = File(...)):
             "status": True,
             "user_id": match["user_id"],
             "similarity": round(match["similarity"], 4),
-            "appearance_variation": has_variation,
+            "appearance_variation": False,
+            "threshold": SEARCH_HIGH_CONFIDENCE,
         }
         cache_json_event(f"fiass:face:search:req:{req_id}", cache_payload, 3600)
         cache_json_event("fiass:face:search:last", cache_payload, 86400)
