@@ -514,9 +514,12 @@ FACE_MATCH_MIN_MARGIN = float(os.getenv("FACE_MATCH_MIN_MARGIN", "0.04"))
 REG_MIN_IMAGE_DIM = int(os.getenv("REG_MIN_IMAGE_DIM", "320"))            # full image min dimension
 REG_MIN_FACE_SIZE = int(os.getenv("REG_MIN_FACE_SIZE", "160"))            # face bbox min width/height
 REG_MIN_BLUR_VARIANCE = float(os.getenv("REG_MIN_BLUR_VARIANCE", "80"))   # sharper than auth capture
-REG_MAX_YAW_DEGREES = float(os.getenv("REG_MAX_YAW_DEGREES", "30"))       # head turn (left-right)
-REG_MAX_PITCH_DEGREES = float(os.getenv("REG_MAX_PITCH_DEGREES", "15"))   # head tilt (up-down)
-REG_MAX_ROLL_DEGREES = float(os.getenv("REG_MAX_ROLL_DEGREES", "10"))     # head rotation sideways
+# Mobile-selfie realistic envelope. Strict enough to keep enrollment frontal
+# without producing false rejects when the phone is held slightly low/high
+# (which adds apparent pitch) or when the front camera is off-axis.
+REG_MAX_YAW_DEGREES = float(os.getenv("REG_MAX_YAW_DEGREES", "35"))       # head turn (left-right)
+REG_MAX_PITCH_DEGREES = float(os.getenv("REG_MAX_PITCH_DEGREES", "22"))   # head tilt (up-down)
+REG_MAX_ROLL_DEGREES = float(os.getenv("REG_MAX_ROLL_DEGREES", "15"))     # head rotation sideways
 REG_MIN_BRIGHTNESS = float(os.getenv("REG_MIN_BRIGHTNESS", "55"))         # mean pixel brightness
 REG_MAX_BRIGHTNESS = float(os.getenv("REG_MAX_BRIGHTNESS", "210"))
 REG_MIN_CONTRAST = float(os.getenv("REG_MIN_CONTRAST", "20"))             # std-dev of brightness
