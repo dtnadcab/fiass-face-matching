@@ -622,10 +622,26 @@ def estimate_face_pose(
             yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
             roll = 0.0
 
-        # OpenCV's camera frame → normalize into the simple user-facing ranges.
-        # "Looking straight" should map to (~0, ~0, ~0).
-        # Pitch positive = looking down → invert so positive = looking up.
+        # OpenCV Euler extraction can sometimes produce equivalent angles near
+        # +/-180 for near-frontal faces. Normalize to human-friendly ranges to
+        # avoid false rejects like pitch=163 or roll=-166 on a straight face.
+        def _normalize_pose_angle(deg: float) -> float:
+            # First fold to [-180, 180].
+            a = ((float(deg) + 180.0) % 360.0) - 180.0
+            # Then fold equivalent near-180 solutions into [-90, 90].
+            if a > 90.0:
+                a = 180.0 - a
+            elif a < -90.0:
+                a = -180.0 - a
+            return a
+
+        # Pitch positive = looking down in this decomposition; invert so
+        # positive means looking up (more intuitive for thresholds).
         pitch = -pitch
+        yaw = _normalize_pose_angle(yaw)
+        pitch = _normalize_pose_angle(pitch)
+        roll = _normalize_pose_angle(roll)
+
         result["yaw"] = float(round(yaw, 2))
         result["pitch"] = float(round(pitch, 2))
         result["roll"] = float(round(roll, 2))
