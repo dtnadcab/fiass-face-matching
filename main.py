@@ -518,7 +518,7 @@ REG_MIN_BLUR_VARIANCE = float(os.getenv("REG_MIN_BLUR_VARIANCE", "80"))   # shar
 # without producing false rejects when the phone is held slightly low/high
 # (which adds apparent pitch) or when the front camera is off-axis.
 REG_MAX_YAW_DEGREES = float(os.getenv("REG_MAX_YAW_DEGREES", "35"))       # head turn (left-right)
-REG_MAX_PITCH_DEGREES = float(os.getenv("REG_MAX_PITCH_DEGREES", "22"))   # head tilt (up-down)
+REG_MAX_PITCH_DEGREES = float(os.getenv("REG_MAX_PITCH_DEGREES", "25"))   # head tilt (up-down)
 REG_MAX_ROLL_DEGREES = float(os.getenv("REG_MAX_ROLL_DEGREES", "15"))     # head rotation sideways
 REG_MIN_BRIGHTNESS = float(os.getenv("REG_MIN_BRIGHTNESS", "55"))         # mean pixel brightness
 REG_MAX_BRIGHTNESS = float(os.getenv("REG_MAX_BRIGHTNESS", "210"))
