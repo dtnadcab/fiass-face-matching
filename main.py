@@ -1412,7 +1412,7 @@ async def add_face_endpoint(user_id: str, image: UploadFile = File(...)):
     """Register a face for a user. Enforces ICAO-style production gates:
       * image resolution, face size & framing
       * blur, brightness, contrast
-      * frontal pose (roll angle)
+      * frontal pose (yaw/pitch/roll envelope)
       * single face only
       * landmark completeness (no occlusion)
       * duplicate reject above ADD_FACE_REJECT_THRESHOLD
@@ -1432,25 +1432,31 @@ async def add_face_endpoint(user_id: str, image: UploadFile = File(...)):
         img_np = np.array(pil_img)
         img_w, img_h = pil_img.size
 
-        # 2) Detect all faces on the original (not rotated) to enforce
-        # single-face rule correctly.
-        all_faces = face_recognition.face_locations(img_np, model="hog") or []
-        if not all_faces:
-            # Try upscale once — do not rotate; we want selfies framed correctly.
-            if max(img_w, img_h) < 600:
-                scale = 600.0 / max(img_w, img_h)
-                up = cv2.resize(img_np, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                all_faces = face_recognition.face_locations(up, model="hog") or []
-                if all_faces:
-                    img_np = up
-                    img_w, img_h = up.shape[1], up.shape[0]
+        # 2) Robust detection (rotation + upsample + CLAHE + CNN fallback).
+        # This avoids false "no_face_detected" rejects on real device captures
+        # where EXIF/camera orientation or contrast can vary.
+        all_faces, det_img = robust_face_detection(img_np, label="add_face")
+        if all_faces:
+            img_np = det_img
+            img_h, img_w = img_np.shape[:2]
 
         if not all_faces:
+            # Helpful telemetry for debugging in production logs.
+            try:
+                gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                blur_v = cv2.Laplacian(gray, cv2.CV_64F).var()
+                mean_v = gray.mean()
+                logger.warning(
+                    f"[add_face] no_face_detected user={user_id} "
+                    f"img={img_w}x{img_h} blur={blur_v:.2f} brightness={mean_v:.2f}"
+                )
+            except Exception:
+                pass
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "no_face_detected",
-                    "message": "No face detected. Please face the camera in good lighting.",
+                    "message": "No face detected. Please keep your full face inside the frame, look straight, and use good front lighting.",
                 },
             )
 
